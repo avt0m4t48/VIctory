@@ -15,4 +15,5 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install
-      - run: cargo test --locked -p victory-gpu --features diagnostics pipeline::library:: -- --nocapture
+      - run: >-
+          cargo test --locked -p victory-gpu --features diagnostics pipeline::library:: -- --nocapture
