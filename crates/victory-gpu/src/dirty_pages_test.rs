@@ -282,7 +282,10 @@ fn hardware_dirty_pages() -> Result<()> {
                 Err(e) => return Err(e),
             };
             let desc = adapter.GetDesc1()?;
-            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+            // The Microsoft Basic adapter can appear without the software flag
+            // when DXGI enumerates the default display adapter.
+            let basic_render_driver = (desc.VendorId, desc.DeviceId) == (0x1414, 0x008c);
+            if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 || basic_render_driver {
                 continue;
             }
             let mut device = None;
