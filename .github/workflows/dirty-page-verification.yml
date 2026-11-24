@@ -1,0 +1,17 @@
+name: Dirty-page comparison verification
+on:
+  push:
+    branches: [verify/dirty-page-gpu-compare]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: >-
+          cargo test --locked -p victory-gpu --features diagnostics dirty_pages_test:: -- --nocapture --test-threads=1
