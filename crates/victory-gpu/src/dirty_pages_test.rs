@@ -87,7 +87,7 @@ fn assert_bytes(case: &str, actual: &[u8], expected: &[u8], start: usize) {
 
 fn verify(fixture: &Fixture, case: Case) -> Result<()> {
     let before: Vec<_> = (0..INPUT_BYTES)
-        .map(|i| (37 * i ^ (i >> 3)) as u8)
+        .map(|i| ((37 * i) ^ (i >> 3)) as u8)
         .collect();
     let mut after = before.clone();
     for &at in &case.changes {

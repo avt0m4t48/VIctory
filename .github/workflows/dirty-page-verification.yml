@@ -6,12 +6,36 @@ permissions:
   contents: read
 jobs:
   warp:
+    name: D3D12 / ${{ matrix.mode }}
     runs-on: windows-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [candidate, missing-edge-mask]
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
       - run: rustup toolchain install
-      - run: >-
-          cargo test --locked -p victory-gpu --features diagnostics dirty_pages_test:: -- --nocapture --test-threads=1
+      - name: Run the D3D12 fixture
+        shell: pwsh
+        env:
+          DIRTY_PAGE_MODE: ${{ matrix.mode }}
+        run: |
+          if ($env:DIRTY_PAGE_MODE -eq 'candidate') {
+            cargo test --locked -p victory-gpu --features diagnostics dirty_pages_test:: -- --nocapture --test-threads=1
+            exit $LASTEXITCODE
+          }
+          $path = 'crates/victory-gpu/src/dirty_pages.hlsl'
+          $text = Get-Content -LiteralPath $path -Raw
+          $original = 'return (previous ^ next) & keep;'
+          if (!$text.Contains($original)) { throw 'Edge mask missing' }
+          [IO.File]::WriteAllText((Resolve-Path $path), $text.Replace($original, 'return previous ^ next;'))
+          $output = & cargo test --locked -p victory-gpu --features diagnostics dirty_pages_test::warp_dirty_pages -- --nocapture --exact 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($code -ne 101 -or ($output -join "`n") -notmatch 'unrelated and guard bytes: dirty count') {
+            throw 'The removed edge mask did not cause the expected D3D12 regression'
+          }
+          exit 0
