@@ -1,0 +1,18 @@
+name: Pipeline library shard verification
+on:
+  push:
+    branches: [verify/pipeline-library-shards]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      VICTORY_D3D12_WARP: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - run: cargo test --locked -p victory-gpu --features diagnostics pipeline::library:: -- --nocapture
