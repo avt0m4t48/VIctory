@@ -86,10 +86,21 @@ impl Task {
     }
 }
 
+struct PendingTask {
+    // The flag identifies the submitting queue and remains live until the task runs.
+    owner_terminated: Arc<AtomicBool>,
+    task: Task,
+}
+
+impl PendingTask {
+    fn run(self) {
+        self.task.run(self.owner_terminated.load(Ordering::Acquire));
+    }
+}
+
 struct Port {
     mode: Mode,
-    /// Queued tasks paired with the id of the queue that submitted them.
-    tasks: Mutex<VecDeque<(u64, Task)>>,
+    tasks: Mutex<VecDeque<PendingTask>>,
     ready: Condvar,
 }
 
@@ -107,7 +118,7 @@ impl Port {
             std::thread::spawn(move || {
                 loop {
                     match worker.take(1000, || false) {
-                        Some(task) => task.run(false),
+                        Some(task) => task.run(),
                         None if Arc::strong_count(&worker) == 1 => break,
                         None => {}
                     }
@@ -117,10 +128,9 @@ impl Port {
         port
     }
 
-    /// Queues or runs `task` on behalf of queue `owner`. Returns false if a
-    /// queued port saw `terminated` under the port lock and canceled it
-    /// instead.
-    fn submit(&self, owner: u64, terminated: &AtomicBool, task: Task) -> bool {
+    /// Queues or runs a task on behalf of the submitting queue. Returns false
+    /// if termination cancels it before it can be enqueued.
+    fn submit(&self, owner_terminated: &Arc<AtomicBool>, task: Task) -> bool {
         match self.mode {
             Mode::Immediate => {
                 task.run(false);
@@ -132,12 +142,15 @@ impl Port {
             }
             Mode::Manual | Mode::Serialized => {
                 let mut tasks = lock(&self.tasks);
-                if terminated.load(Ordering::Acquire) {
+                if owner_terminated.load(Ordering::Acquire) {
                     drop(tasks);
                     task.run(true);
                     return false;
                 }
-                tasks.push_back((owner, task));
+                tasks.push_back(PendingTask {
+                    owner_terminated: Arc::clone(owner_terminated),
+                    task,
+                });
                 self.ready.notify_one();
                 true
             }
@@ -146,8 +159,8 @@ impl Port {
 
     /// The next queued task, waiting up to `timeout_ms`, or until `ended`
     /// (checked whenever the port is woken) says no task will come.
-    fn take(&self, timeout_ms: u32, ended: impl Fn() -> bool) -> Option<Task> {
-        let waiting = |t: &mut VecDeque<(u64, Task)>| t.is_empty() && !ended();
+    fn take(&self, timeout_ms: u32, ended: impl Fn() -> bool) -> Option<PendingTask> {
+        let waiting = |t: &mut VecDeque<PendingTask>| t.is_empty() && !ended();
         let tasks = lock(&self.tasks);
         let mut tasks = if timeout_ms == INFINITE {
             self.ready
@@ -160,20 +173,20 @@ impl Port {
                 .unwrap_or_else(|e| e.into_inner())
                 .0
         };
-        tasks.pop_front().map(|(_, task)| task)
+        tasks.pop_front()
     }
 
-    /// Removes every queued task submitted through `owner`, keeping both
-    /// the removed tasks and other queues' remaining tasks in FIFO order.
-    fn take_owned(&self, owner: u64) -> Vec<Task> {
+    /// Removes the submitting queue's pending tasks, preserving FIFO order
+    /// for both the removed tasks and the tasks that stay queued.
+    fn take_owned(&self, owner_terminated: &Arc<AtomicBool>) -> Vec<Task> {
         let mut tasks = lock(&self.tasks);
         let mut owned = Vec::new();
         for _ in 0..tasks.len() {
-            if let Some((id, task)) = tasks.pop_front() {
-                if id == owner {
-                    owned.push(task);
+            if let Some(pending) = tasks.pop_front() {
+                if Arc::ptr_eq(&pending.owner_terminated, owner_terminated) {
+                    owned.push(pending.task);
                 } else {
-                    tasks.push_back((id, task));
+                    tasks.push_back(pending);
                 }
             }
         }
@@ -224,24 +237,20 @@ impl Pool {
     }
 }
 
-static NEXT_QUEUE: AtomicU64 = AtomicU64::new(1);
-
 /// A queue handle is `Arc::into_raw` of this; duplicating and closing a
 /// handle add and drop a reference.
 pub struct Queue {
-    id: u64,
     ports: [Arc<Port>; 2],
     monitors: Mutex<Vec<(u64, usize, usize)>>,
-    terminated: AtomicBool,
+    terminated: Arc<AtomicBool>,
 }
 
 impl Queue {
     fn new(ports: [Arc<Port>; 2]) -> Arc<Queue> {
         Arc::new(Queue {
-            id: NEXT_QUEUE.fetch_add(1, Ordering::Relaxed),
             ports,
             monitors: Mutex::default(),
-            terminated: AtomicBool::new(false),
+            terminated: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -265,7 +274,7 @@ impl Queue {
     }
 
     fn deliver(self: &Arc<Self>, port: u32, task: Task) {
-        if !self.ports[port as usize].submit(self.id, &self.terminated, task) {
+        if !self.ports[port as usize].submit(&self.terminated, task) {
             return;
         }
         // Copied out: a monitor may unregister itself.
@@ -389,7 +398,7 @@ pub fn XTaskQueueDispatch(handle: *const Queue, port: u32, timeout_ms: u32) -> b
     }
     match port.take(timeout_ms, || queue.terminated.load(Ordering::Acquire)) {
         Some(task) => {
-            task.run(false);
+            task.run();
             true
         }
         None => false,
@@ -422,7 +431,7 @@ pub fn XTaskQueueTerminate(
     };
     queue.terminated.store(true, Ordering::Release);
     for port in &queue.ports {
-        let pending = port.take_owned(queue.id);
+        let pending = port.take_owned(&queue.terminated);
         // Dispatches waiting on this queue end: nothing more will come.
         // (Those of other queues on the port see theirs is open and wait
         // on.) After the lock above, so none misses both flag and wake.
